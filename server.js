@@ -1,12 +1,12 @@
 const http = require("http");
+const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 const admin = require("firebase-admin");
 
 const PORT = process.env.PORT || 8080;
-const CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const USER_RE = /^[A-Za-z0-9_]{3,16}$/;
-const RESERVED = ["admin", "administrator", "support", "moderator", "system", "official"];
+const RESERVED = ["admin", "administrator", "support", "moderator", "system", "official", "guest"];
 const rooms = new Map();
 const online = new Map();
 
@@ -19,6 +19,10 @@ try {
   db = admin.database();
 } catch (e) {
   console.log("FIREBASE SETUP ERROR:", e.message);
+}
+
+function sha(s) {
+  return crypto.createHash("sha256").update(s).digest("hex");
 }
 
 function genCode() {
@@ -59,31 +63,23 @@ function leave(ws) {
   }
 }
 
-async function verifyIdToken(token) {
-  try {
-    const r = await fetch("https://oauth2.googleapis.com/tokeninfo?id_token=" + encodeURIComponent(token));
-    if (!r.ok) return null;
-    const j = await r.json();
-    if (!j.sub) return null;
-    if (CLIENT_ID && j.aud !== CLIENT_ID) return null;
-    if (j.exp && Number(j.exp) * 1000 < Date.now()) return null;
-    return j;
-  } catch (e) {
-    return null;
-  }
-}
-
-async function doAuth(ws, token) {
+async function doAuth(ws, gid, secret) {
   if (!db) return send(ws, { t: "auth_err", m: "server_config" });
-  const info = await verifyIdToken(String(token || ""));
-  if (!info) return send(ws, { t: "auth_err", m: "bad_token" });
-  const uid = info.sub;
+  gid = String(gid || "");
+  secret = String(secret || "");
+  if (!/^[a-f0-9]{16}$/.test(gid) || !/^[a-f0-9]{32}$/.test(secret)) {
+    return send(ws, { t: "auth_err", m: "bad_creds" });
+  }
+  const uid = "g_" + gid;
   const ref = db.ref("users/" + uid);
   const snap = await ref.once("value");
   let user = snap.val();
+  const h = sha(secret);
   if (!user) {
-    user = { name: info.name || "Player", email: info.email || "", username: "", created: Date.now() };
+    user = { name: "Guest", username: "", secretHash: h, created: Date.now() };
     await ref.set(user);
+  } else if (user.secretHash !== h) {
+    return send(ws, { t: "auth_err", m: "bad_secret" });
   }
   await ref.update({ lastSeen: Date.now() });
   const old = online.get(uid);
@@ -119,7 +115,7 @@ async function handle(ws, m) {
     return;
   }
   if (t === "ping") return;
-  if (t === "auth") return doAuth(ws, m.token);
+  if (t === "auth") return doAuth(ws, m.gid, m.secret);
   if (t === "claim") return doClaim(ws, m.username);
 
   if (t === "create" || t === "join") {
@@ -176,7 +172,7 @@ async function handle(ws, m) {
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("ok rooms=" + rooms.size + " db=" + (db ? "yes" : "NO") + " client=" + (CLIENT_ID ? "yes" : "NO"));
+  res.end("ok rooms=" + rooms.size + " db=" + (db ? "yes" : "NO"));
 });
 
 const wss = new WebSocketServer({ server, maxPayload: 8192 });
