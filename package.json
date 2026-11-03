@@ -4,5 +4,8 @@
   "main": "server.js",
   "engines": { "node": ">=18" },
   "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.18.0" }
+  "dependencies": {
+    "ws": "^8.18.0",
+    "firebase-admin": "^12.7.0"
+  }
 }
