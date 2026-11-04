@@ -9,6 +9,9 @@ const USER_RE = /^[A-Za-z0-9_]{3,16}$/;
 const RESERVED = ["admin", "administrator", "support", "moderator", "system", "official", "guest"];
 const rooms = new Map();
 const online = new Map();
+const parties = new Map();
+const invites = new Map();
+let partySeq = 1;
 
 let db = null;
 try {
@@ -63,6 +66,115 @@ function leave(ws) {
   }
 }
 
+// ---------- PARTY ----------
+function partyOf(ws) {
+  return ws.party ? parties.get(ws.party) : null;
+}
+
+function partyMsg(p) {
+  const names = p.members.map((u) => { const w = online.get(u); return w ? w.username : ""; });
+  const lw = online.get(p.leader);
+  return { t: "pt_state", leader: lw ? lw.username : "", members: names };
+}
+
+function broadcastParty(p) {
+  const msg = partyMsg(p);
+  for (const u of p.members) send(online.get(u), msg);
+}
+
+function removeFromParty(ws, reason) {
+  if (!ws.party) return;
+  const p = parties.get(ws.party);
+  ws.party = null;
+  send(ws, reason ? { t: reason } : { t: "pt_state", leader: "", members: [] });
+  if (!p) return;
+  p.members = p.members.filter((u) => u !== ws.uid);
+  if (p.members.length <= 1) {
+    for (const u of p.members) {
+      const w = online.get(u);
+      if (w) { w.party = null; send(w, { t: "pt_state", leader: "", members: [] }); }
+    }
+    parties.delete(p.id);
+    return;
+  }
+  if (p.leader === ws.uid) p.leader = p.members[0];
+  broadcastParty(p);
+}
+
+function findFriendUid(ws, uname) {
+  const l = String(uname || "").toLowerCase();
+  if (!ws.friends) return null;
+  for (const [fuid, fname] of ws.friends) {
+    if (String(fname).toLowerCase() === l) return fuid;
+  }
+  return null;
+}
+
+function ptInvite(ws, uname) {
+  const reply = (ok, m) => send(ws, { t: "pt_result", a: "invite", ok, m, username: String(uname || "") });
+  const fuid = findFriendUid(ws, uname);
+  if (!fuid) return reply(false, "not_friend");
+  const tws = online.get(fuid);
+  if (!tws) return reply(false, "offline");
+  const p = partyOf(ws);
+  if (p && p.leader !== ws.uid) return reply(false, "not_leader");
+  if (p && p.members.length >= 4) return reply(false, "full");
+  if (p && p.members.includes(fuid)) return reply(false, "already_in");
+  invites.set(fuid, { from: ws.uid, time: Date.now() });
+  send(tws, { t: "pt_invite", from: ws.username });
+  reply(true, "sent");
+}
+
+function ptAccept(ws) {
+  const inv = invites.get(ws.uid);
+  invites.delete(ws.uid);
+  const fail = (m) => send(ws, { t: "pt_result", a: "accept", ok: false, m, username: "" });
+  if (!inv || Date.now() - inv.time > 60000) return fail("expired");
+  const lws = online.get(inv.from);
+  if (!lws) return fail("offline");
+  if (ws.party) removeFromParty(ws);
+  let p = partyOf(lws);
+  if (!p) {
+    p = { id: partySeq++, leader: lws.uid, members: [lws.uid] };
+    parties.set(p.id, p);
+    lws.party = p.id;
+  }
+  if (p.members.length >= 4) return fail("full");
+  p.members.push(ws.uid);
+  ws.party = p.id;
+  broadcastParty(p);
+  send(lws, { t: "pt_result", a: "joined", ok: true, m: "joined", username: ws.username });
+}
+
+function ptDecline(ws) {
+  const inv = invites.get(ws.uid);
+  invites.delete(ws.uid);
+  if (!inv) return;
+  send(online.get(inv.from), { t: "pt_result", a: "declined", ok: true, m: "declined", username: ws.username });
+}
+
+function ptKick(ws, uname) {
+  const p = partyOf(ws);
+  if (!p || p.leader !== ws.uid) return;
+  const l = String(uname || "").toLowerCase();
+  for (const u of p.members) {
+    const w = online.get(u);
+    if (w && u !== ws.uid && w.username.toLowerCase() === l) {
+      removeFromParty(w, "pt_kicked");
+      return;
+    }
+  }
+}
+
+function ptEmote(ws, clip) {
+  const p = partyOf(ws);
+  if (!p) return;
+  const msg = { t: "p_emote", username: ws.username, clip: String(clip || "").slice(0, 32) };
+  for (const u of p.members) {
+    if (u !== ws.uid) send(online.get(u), msg);
+  }
+}
+
 // ---------- ACCOUNT ----------
 async function loadFriends(ws) {
   ws.friends = new Map();
@@ -100,6 +212,7 @@ async function doAuth(ws, gid, secret) {
   await ref.update({ lastSeen: Date.now() });
   const old = online.get(uid);
   if (old && old !== ws) {
+    removeFromParty(old);
     send(old, { t: "kicked" });
     old.close();
   }
@@ -217,7 +330,7 @@ async function frRemove(ws, uname) {
 // ---------- MESSAGES ----------
 async function handle(ws, m) {
   const t = m.t;
-  if (t === "s" || t === "dmg") {
+  if (t === "s" || t === "dmg" || t === "fx") {
     const o = other(ws);
     if (o) send(o, m);
     return;
@@ -235,6 +348,20 @@ async function handle(ws, m) {
     if (t === "fr_accept") return frAccept(ws, m.username);
     if (t === "fr_decline") return frDecline(ws, m.username);
     if (t === "fr_remove") return frRemove(ws, m.username);
+  }
+
+  if (t === "pt_get" || t === "pt_invite" || t === "pt_accept" || t === "pt_decline" || t === "pt_kick" || t === "pt_leave" || t === "p_emote") {
+    if (!ws.uid || !ws.username) return;
+    if (t === "pt_get") {
+      const p = partyOf(ws);
+      return send(ws, p ? partyMsg(p) : { t: "pt_state", leader: "", members: [] });
+    }
+    if (t === "pt_invite") return ptInvite(ws, m.username);
+    if (t === "pt_accept") return ptAccept(ws);
+    if (t === "pt_decline") return ptDecline(ws);
+    if (t === "pt_kick") return ptKick(ws, m.username);
+    if (t === "pt_leave") return removeFromParty(ws);
+    if (t === "p_emote") return ptEmote(ws, m.clip);
   }
 
   if (t === "create" || t === "join") {
@@ -291,7 +418,7 @@ async function handle(ws, m) {
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("ok rooms=" + rooms.size + " online=" + online.size + " db=" + (db ? "yes" : "NO"));
+  res.end("ok rooms=" + rooms.size + " online=" + online.size + " parties=" + parties.size + " db=" + (db ? "yes" : "NO"));
 });
 
 const wss = new WebSocketServer({ server, maxPayload: 8192 });
@@ -302,11 +429,13 @@ wss.on("connection", (ws) => {
   ws.uid = "";
   ws.username = "";
   ws.friends = null;
+  ws.party = null;
   ws.on("pong", () => { ws.isAlive = true; });
   ws.on("error", () => {});
   ws.on("close", () => {
     leave(ws);
     if (ws.uid && online.get(ws.uid) === ws) {
+      removeFromParty(ws);
       online.delete(ws.uid);
       if (ws.username) notifyPresence(ws, false);
     }
