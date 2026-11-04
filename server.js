@@ -63,6 +63,22 @@ function leave(ws) {
   }
 }
 
+// ---------- ACCOUNT ----------
+async function loadFriends(ws) {
+  ws.friends = new Map();
+  const snap = await db.ref("friends/" + ws.uid).once("value");
+  const v = snap.val() || {};
+  for (const fuid of Object.keys(v)) ws.friends.set(fuid, v[fuid]);
+}
+
+function notifyPresence(ws, isOnline) {
+  if (!ws.friends) return;
+  for (const [fuid] of ws.friends) {
+    const f = online.get(fuid);
+    if (f) send(f, { t: "fr_presence", username: ws.username, online: isOnline });
+  }
+}
+
 async function doAuth(ws, gid, secret) {
   if (!db) return send(ws, { t: "auth_err", m: "server_config" });
   gid = String(gid || "");
@@ -90,7 +106,9 @@ async function doAuth(ws, gid, secret) {
   online.set(uid, ws);
   ws.uid = uid;
   ws.username = user.username || "";
+  await loadFriends(ws);
   send(ws, { t: "auth_ok", uid, name: user.name || "", username: ws.username });
+  if (ws.username) notifyPresence(ws, true);
 }
 
 async function doClaim(ws, name) {
@@ -107,6 +125,96 @@ async function doClaim(ws, name) {
   send(ws, { t: "claim_ok", username: name });
 }
 
+// ---------- FRIENDS ----------
+async function frList(ws) {
+  const fsnap = await db.ref("friends/" + ws.uid).once("value");
+  const rsnap = await db.ref("requests/" + ws.uid).once("value");
+  const f = fsnap.val() || {};
+  const r = rsnap.val() || {};
+  const friends = Object.keys(f).map((fuid) => ({ username: f[fuid], online: online.has(fuid) }));
+  const requests = Object.keys(r).map((ruid) => r[ruid]);
+  send(ws, { t: "fr_data", friends, requests });
+}
+
+async function makeFriends(ws, ouid, oname) {
+  const upd = {};
+  upd["friends/" + ws.uid + "/" + ouid] = oname;
+  upd["friends/" + ouid + "/" + ws.uid] = ws.username;
+  upd["requests/" + ws.uid + "/" + ouid] = null;
+  upd["requests/" + ouid + "/" + ws.uid] = null;
+  await db.ref().update(upd);
+  if (ws.friends) ws.friends.set(ouid, oname);
+  const ows = online.get(ouid);
+  if (ows) {
+    if (ows.friends) ows.friends.set(ws.uid, ws.username);
+    send(ows, { t: "fr_accepted", username: ws.username });
+    send(ows, { t: "fr_presence", username: ws.username, online: true });
+    send(ws, { t: "fr_presence", username: oname, online: true });
+  }
+}
+
+async function frSend(ws, uname) {
+  uname = String(uname || "").trim();
+  const reply = (ok, m) => send(ws, { t: "fr_result", a: "send", ok, m, username: uname });
+  if (!USER_RE.test(uname)) return reply(false, "invalid");
+  const tuid = (await db.ref("usernames/" + uname.toLowerCase()).once("value")).val();
+  if (!tuid) return reply(false, "not_found");
+  if (tuid === ws.uid) return reply(false, "self");
+  const already = await db.ref("friends/" + ws.uid + "/" + tuid).once("value");
+  if (already.exists()) return reply(false, "already_friends");
+  const tname = (await db.ref("users/" + tuid + "/username").once("value")).val() || uname;
+  const rev = await db.ref("requests/" + ws.uid + "/" + tuid).once("value");
+  if (rev.exists()) {
+    await makeFriends(ws, tuid, tname);
+    return reply(true, "became_friends");
+  }
+  const dup = await db.ref("requests/" + tuid + "/" + ws.uid).once("value");
+  if (dup.exists()) return reply(false, "already_sent");
+  await db.ref("requests/" + tuid + "/" + ws.uid).set(ws.username);
+  const tws = online.get(tuid);
+  if (tws) send(tws, { t: "fr_new_request", username: ws.username });
+  reply(true, "sent");
+}
+
+async function frAccept(ws, uname) {
+  uname = String(uname || "").trim();
+  const reply = (ok, m) => send(ws, { t: "fr_result", a: "accept", ok, m, username: uname });
+  if (!USER_RE.test(uname)) return reply(false, "invalid");
+  const tuid = (await db.ref("usernames/" + uname.toLowerCase()).once("value")).val();
+  if (!tuid) return reply(false, "not_found");
+  const rq = await db.ref("requests/" + ws.uid + "/" + tuid).once("value");
+  if (!rq.exists()) return reply(false, "no_request");
+  await makeFriends(ws, tuid, String(rq.val()));
+  reply(true, "ok");
+}
+
+async function frDecline(ws, uname) {
+  uname = String(uname || "").trim();
+  const reply = (ok, m) => send(ws, { t: "fr_result", a: "decline", ok, m, username: uname });
+  if (!USER_RE.test(uname)) return reply(false, "invalid");
+  const tuid = (await db.ref("usernames/" + uname.toLowerCase()).once("value")).val();
+  if (!tuid) return reply(false, "not_found");
+  await db.ref("requests/" + ws.uid + "/" + tuid).remove();
+  reply(true, "declined");
+}
+
+async function frRemove(ws, uname) {
+  uname = String(uname || "").trim();
+  const reply = (ok, m) => send(ws, { t: "fr_result", a: "remove", ok, m, username: uname });
+  if (!USER_RE.test(uname)) return reply(false, "invalid");
+  const tuid = (await db.ref("usernames/" + uname.toLowerCase()).once("value")).val();
+  if (!tuid) return reply(false, "not_found");
+  const upd = {};
+  upd["friends/" + ws.uid + "/" + tuid] = null;
+  upd["friends/" + tuid + "/" + ws.uid] = null;
+  await db.ref().update(upd);
+  if (ws.friends) ws.friends.delete(tuid);
+  const ows = online.get(tuid);
+  if (ows && ows.friends) ows.friends.delete(ws.uid);
+  reply(true, "removed");
+}
+
+// ---------- MESSAGES ----------
 async function handle(ws, m) {
   const t = m.t;
   if (t === "s" || t === "dmg") {
@@ -117,6 +225,17 @@ async function handle(ws, m) {
   if (t === "ping") return;
   if (t === "auth") return doAuth(ws, m.gid, m.secret);
   if (t === "claim") return doClaim(ws, m.username);
+
+  if (t === "fr_list" || t === "fr_send" || t === "fr_accept" || t === "fr_decline" || t === "fr_remove") {
+    if (!db || !ws.uid || !ws.username) {
+      return send(ws, { t: "fr_result", a: "any", ok: false, m: "auth", username: "" });
+    }
+    if (t === "fr_list") return frList(ws);
+    if (t === "fr_send") return frSend(ws, m.username);
+    if (t === "fr_accept") return frAccept(ws, m.username);
+    if (t === "fr_decline") return frDecline(ws, m.username);
+    if (t === "fr_remove") return frRemove(ws, m.username);
+  }
 
   if (t === "create" || t === "join") {
     if (!ws.uid || !ws.username) return send(ws, { t: "err", m: "auth" });
@@ -172,7 +291,7 @@ async function handle(ws, m) {
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("ok rooms=" + rooms.size + " db=" + (db ? "yes" : "NO"));
+  res.end("ok rooms=" + rooms.size + " online=" + online.size + " db=" + (db ? "yes" : "NO"));
 });
 
 const wss = new WebSocketServer({ server, maxPayload: 8192 });
@@ -182,11 +301,15 @@ wss.on("connection", (ws) => {
   ws.room = null;
   ws.uid = "";
   ws.username = "";
+  ws.friends = null;
   ws.on("pong", () => { ws.isAlive = true; });
   ws.on("error", () => {});
   ws.on("close", () => {
     leave(ws);
-    if (ws.uid && online.get(ws.uid) === ws) online.delete(ws.uid);
+    if (ws.uid && online.get(ws.uid) === ws) {
+      online.delete(ws.uid);
+      if (ws.username) notifyPresence(ws, false);
+    }
   });
   ws.on("message", async (raw) => {
     let m;
