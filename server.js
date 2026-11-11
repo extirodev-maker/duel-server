@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 8080;
 const CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const USER_RE = /^[A-Za-z0-9_]{3,16}$/;
 const RESERVED = ["admin", "administrator", "support", "moderator", "system", "official", "guest"];
+const TIERS = [["BRONZE", 0], ["SILVER", 100], ["GOLD", 250], ["PLATINUM", 450], ["DIAMOND", 700], ["HEROIC", 1000], ["GRANDMASTER", 1400]];
 const rooms = new Map();
 const online = new Map();
 const parties = new Map();
@@ -64,6 +65,62 @@ function leave(ws) {
       send(room.host, { t: "guest_left" });
     }
   }
+}
+
+// ---------- PROFILE / REWARDS ----------
+function levelOf(xp) {
+  return 1 + Math.floor(Math.sqrt(Math.max(xp, 0) / 60));
+}
+
+function tierOf(rp) {
+  let name = TIERS[0][0];
+  for (const t of TIERS) if (rp >= t[1]) name = t[0];
+  return name;
+}
+
+function profileOf(u) {
+  return {
+    coins: u.coins || 0, gems: u.gems || 0, xp: u.xp || 0, rp: u.rp || 0,
+    matches: u.matches || 0, wins: u.wins || 0, kills: u.kills || 0, best: u.best || 0,
+  };
+}
+
+async function doMatchEnd(ws, m) {
+  if (!db || !ws.uid || !ws.username) return;
+  const mid = String(m.mid || "").slice(0, 24);
+  const rank = Math.max(1, Math.min(40, Math.floor(Number(m.rank)) || 40));
+  const kills = Math.max(0, Math.min(40, Math.floor(Number(m.kills)) || 0));
+  const win = rank === 1 && !!m.win;
+  const dur = Math.max(0, Math.min(3600, Math.floor(Number(m.dur)) || 0));
+  const ref = db.ref("users/" + ws.uid);
+  const u = (await ref.once("value")).val() || {};
+  const old = profileOf(u);
+  if (!mid || u.lastMid === mid) return send(ws, { t: "reward", dup: true, profile: old });
+  if (dur < 20) {
+    await ref.update({ lastMid: mid });
+    return send(ws, { t: "reward", coins: 0, xp: 0, rp: 0, level_up: false, tier_up: false, profile: old });
+  }
+  const coins = 20 + kills * 10 + (win ? 100 : 0) + Math.max(0, 20 - rank) * 2;
+  const xp = 30 + kills * 20 + (win ? 150 : 0) + Math.floor(dur / 60) * 10;
+  let rpGain = kills * 2;
+  if (rank === 1) rpGain += 40;
+  else if (rank <= 5) rpGain += 25;
+  else if (rank <= 10) rpGain += 15;
+  else if (rank <= 20) rpGain += 5;
+  else if (rank > 30) rpGain -= 8;
+  const newRp = Math.max(0, old.rp + rpGain);
+  const levelUp = levelOf(old.xp + xp) > levelOf(old.xp);
+  const gemBonus = levelUp ? 10 : 0;
+  const upd = {
+    coins: old.coins + coins, gems: old.gems + gemBonus, xp: old.xp + xp, rp: newRp,
+    matches: old.matches + 1, wins: old.wins + (win ? 1 : 0), kills: old.kills + kills,
+    best: old.best ? Math.min(old.best, rank) : rank, lastMid: mid,
+  };
+  await ref.update(upd);
+  send(ws, {
+    t: "reward", coins, xp, rp: rpGain, level_up: levelUp, tier_up: tierOf(newRp) !== tierOf(old.rp),
+    profile: profileOf({ ...u, ...upd }),
+  });
 }
 
 // ---------- PARTY ----------
@@ -204,7 +261,7 @@ async function doAuth(ws, gid, secret) {
   let user = snap.val();
   const h = sha(secret);
   if (!user) {
-    user = { name: "Guest", username: "", secretHash: h, created: Date.now() };
+    user = { name: "Guest", username: "", secretHash: h, created: Date.now(), coins: 0, gems: 0, xp: 0, rp: 0 };
     await ref.set(user);
   } else if (user.secretHash !== h) {
     return send(ws, { t: "auth_err", m: "bad_secret" });
@@ -220,7 +277,7 @@ async function doAuth(ws, gid, secret) {
   ws.uid = uid;
   ws.username = user.username || "";
   await loadFriends(ws);
-  send(ws, { t: "auth_ok", uid, name: user.name || "", username: ws.username });
+  send(ws, { t: "auth_ok", uid, name: user.name || "", username: ws.username, profile: profileOf(user) });
   if (ws.username) notifyPresence(ws, true);
 }
 
@@ -338,6 +395,7 @@ async function handle(ws, m) {
   if (t === "ping") return;
   if (t === "auth") return doAuth(ws, m.gid, m.secret);
   if (t === "claim") return doClaim(ws, m.username);
+  if (t === "match_end") return doMatchEnd(ws, m);
 
   if (t === "fr_list" || t === "fr_send" || t === "fr_accept" || t === "fr_decline" || t === "fr_remove") {
     if (!db || !ws.uid || !ws.username) {
@@ -456,7 +514,3 @@ setInterval(() => {
 }, 25000);
 
 server.listen(PORT, () => console.log("server on " + PORT));
-
-
-
-
