@@ -192,7 +192,7 @@ function ptAccept(ws) {
   if (ws.party) removeFromParty(ws);
   let p = partyOf(lws);
   if (!p) {
-    p = { id: partySeq++, leader: lws.uid, members: [lws.uid] };
+    p = { id: partySeq++, leader: lws.uid, members: [lws.uid], matchStart: 0 };
     parties.set(p.id, p);
     lws.party = p.id;
   }
@@ -229,6 +229,35 @@ function ptEmote(ws, clip) {
   const msg = { t: "p_emote", username: ws.username, clip: String(clip || "").slice(0, 32) };
   for (const u of p.members) {
     if (u !== ws.uid) send(online.get(u), msg);
+  }
+}
+
+// ---------- SQUAD MATCH ----------
+function sqStart(ws, m) {
+  const p = partyOf(ws);
+  if (!p || p.leader !== ws.uid || p.members.length < 2) {
+    return send(ws, { t: "pt_result", a: "squad", ok: false, m: "not_leader", username: "" });
+  }
+  if (Date.now() - (p.matchStart || 0) < 15000) return;
+  p.matchStart = Date.now();
+  const names = p.members.map((u) => { const w = online.get(u); return w ? w.username : ""; });
+  const lw = online.get(p.leader);
+  const seed = Math.floor(Math.random() * 1000000000);
+  const msg = { t: "sq_start", map: Number(m.map) || 0, seed, members: names, leader: lw ? lw.username : "" };
+  for (const u of p.members) send(online.get(u), msg);
+}
+
+function relayToParty(ws, m) {
+  const p = partyOf(ws);
+  if (!p) return;
+  const out = { ...m, t: "q", u: ws.username };
+  const to = m.to ? String(m.to) : "";
+  for (const uid of p.members) {
+    if (uid === ws.uid) continue;
+    const w = online.get(uid);
+    if (!w) continue;
+    if (to && w.username !== to) continue;
+    send(w, out);
   }
 }
 
@@ -392,10 +421,12 @@ async function handle(ws, m) {
     if (o) send(o, m);
     return;
   }
+  if (t === "q") return relayToParty(ws, m);
   if (t === "ping") return;
   if (t === "auth") return doAuth(ws, m.gid, m.secret);
   if (t === "claim") return doClaim(ws, m.username);
   if (t === "match_end") return doMatchEnd(ws, m);
+  if (t === "sq_start") return sqStart(ws, m);
 
   if (t === "fr_list" || t === "fr_send" || t === "fr_accept" || t === "fr_decline" || t === "fr_remove") {
     if (!db || !ws.uid || !ws.username) {
@@ -493,6 +524,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     leave(ws);
     if (ws.uid && online.get(ws.uid) === ws) {
+      relayToParty(ws, { k: "left" });
       removeFromParty(ws);
       online.delete(ws.uid);
       if (ws.username) notifyPresence(ws, false);
