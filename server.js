@@ -82,6 +82,7 @@ function profileOf(u) {
   return {
     coins: u.coins || 0, gems: u.gems || 0, xp: u.xp || 0, rp: u.rp || 0,
     matches: u.matches || 0, wins: u.wins || 0, kills: u.kills || 0, best: u.best || 0,
+    skin: u.skin || "default",
   };
 }
 
@@ -117,6 +118,7 @@ async function doMatchEnd(ws, m) {
     best: old.best ? Math.min(old.best, rank) : rank, lastMid: mid,
   };
   await ref.update(upd);
+  await addMissionProgress(ws.uid, { matches: 1, kills, wins: win ? 1 : 0, top10: rank <= 10 ? 1 : 0, minutes: Math.floor(dur / 60) });
   send(ws, {
     t: "reward", coins, xp, rp: rpGain, level_up: levelUp, tier_up: tierOf(newRp) !== tierOf(old.rp),
     profile: profileOf({ ...u, ...upd }),
@@ -130,8 +132,9 @@ function partyOf(ws) {
 
 function partyMsg(p) {
   const names = p.members.map((u) => { const w = online.get(u); return w ? w.username : ""; });
+  const skins = p.members.map((u) => { const w = online.get(u); return w && w.skin ? w.skin : "default"; });
   const lw = online.get(p.leader);
-  return { t: "pt_state", leader: lw ? lw.username : "", members: names };
+  return { t: "pt_state", leader: lw ? lw.username : "", members: names, skins };
 }
 
 function broadcastParty(p) {
@@ -143,13 +146,13 @@ function removeFromParty(ws, reason) {
   if (!ws.party) return;
   const p = parties.get(ws.party);
   ws.party = null;
-  send(ws, reason ? { t: reason } : { t: "pt_state", leader: "", members: [] });
+  send(ws, reason ? { t: reason } : { t: "pt_state", leader: "", members: [], skins: [] });
   if (!p) return;
   p.members = p.members.filter((u) => u !== ws.uid);
   if (p.members.length <= 1) {
     for (const u of p.members) {
       const w = online.get(u);
-      if (w) { w.party = null; send(w, { t: "pt_state", leader: "", members: [] }); }
+      if (w) { w.party = null; send(w, { t: "pt_state", leader: "", members: [], skins: [] }); }
     }
     parties.delete(p.id);
     return;
@@ -305,6 +308,7 @@ async function doAuth(ws, gid, secret) {
   online.set(uid, ws);
   ws.uid = uid;
   ws.username = user.username || "";
+  ws.skin = user.skin || "default";
   await loadFriends(ws);
   send(ws, { t: "auth_ok", uid, name: user.name || "", username: ws.username, profile: profileOf(user) });
   if (ws.username) notifyPresence(ws, true);
@@ -413,6 +417,198 @@ async function frRemove(ws, uname) {
   reply(true, "removed");
 }
 
+// ---------- LEADERBOARD ----------
+async function doLeaderboard(ws) {
+  if (!db || !ws.uid) return;
+  const snap = await db.ref("users").orderByChild("rp").limitToLast(30).once("value");
+  const rows = [];
+  snap.forEach((c) => {
+    const u = c.val() || {};
+    if (u.username) rows.push({ u: u.username, rp: u.rp || 0, xp: u.xp || 0, w: u.wins || 0, k: u.kills || 0 });
+  });
+  rows.sort((a, b) => b.rp - a.rp);
+  const top = rows.slice(0, 20).map((r) => ({ u: r.u, rp: r.rp, lv: levelOf(r.xp), tier: tierOf(r.rp), w: r.w, k: r.k }));
+  const me = (await db.ref("users/" + ws.uid).once("value")).val() || {};
+  const myrp = me.rp || 0;
+  const above = await db.ref("users").orderByChild("rp").startAt(myrp + 1).once("value");
+  send(ws, { t: "lb_data", top, my_rank: above.numChildren() + 1, my_rp: myrp });
+}
+
+// ---------- MISSIONS / LOGIN / STORE ----------
+const MISSION_POOL = [
+  { id: "play", title: "3 match khelo", stat: "matches", target: 3, coins: 60, gems: 0 },
+  { id: "kills5", title: "5 dushman maaro", stat: "kills", target: 5, coins: 80, gems: 0 },
+  { id: "kills10", title: "10 dushman maaro", stat: "kills", target: 10, coins: 130, gems: 0 },
+  { id: "win", title: "1 match jeeto", stat: "wins", target: 1, coins: 150, gems: 5 },
+  { id: "top10", title: "2 baar Top 10 me aao", stat: "top10", target: 2, coins: 70, gems: 0 },
+  { id: "survive", title: "Kul 10 minute zinda raho", stat: "minutes", target: 10, coins: 60, gems: 0 },
+];
+const LOGIN_REWARDS = [
+  { coins: 50, gems: 0 }, { coins: 75, gems: 0 }, { coins: 100, gems: 5 }, { coins: 150, gems: 0 },
+  { coins: 200, gems: 10 }, { coins: 300, gems: 0 }, { coins: 500, gems: 30 },
+];
+const SKINS = {
+  default: { name: "DEFAULT", price: 0, cur: "coins" },
+  crimson: { name: "CRIMSON", price: 500, cur: "coins" },
+  ocean: { name: "OCEAN", price: 500, cur: "coins" },
+  forest: { name: "FOREST", price: 700, cur: "coins" },
+  shadow: { name: "SHADOW", price: 1200, cur: "coins" },
+  gold: { name: "GOLDEN", price: 50, cur: "gems" },
+  neon: { name: "NEON", price: 80, cur: "gems" },
+};
+
+function istNow() {
+  return Date.now() + 19800000;
+}
+
+function istDay(offsetDays) {
+  return new Date(istNow() + (offsetDays || 0) * 86400000).toISOString().slice(0, 10);
+}
+
+function secsToReset() {
+  const now = istNow();
+  const next = (Math.floor(now / 86400000) + 1) * 86400000;
+  return Math.max(0, Math.floor((next - now) / 1000));
+}
+
+function dayMissions(day) {
+  let h = 7;
+  for (const c of day) h = (Math.imul(h, 31) + c.charCodeAt(0)) >>> 0;
+  const pool = MISSION_POOL.slice();
+  const out = [];
+  while (out.length < 3 && pool.length) {
+    h = (Math.imul(h, 1103515245) + 12345) >>> 0;
+    out.push(pool.splice((h >>> 8) % pool.length, 1)[0]);
+  }
+  return out;
+}
+
+async function getMissionState(uid) {
+  const ref = db.ref("users/" + uid + "/missions");
+  let st = (await ref.once("value")).val();
+  const day = istDay(0);
+  if (!st || st.day !== day) {
+    st = { day };
+    await ref.set(st);
+  }
+  st.prog = st.prog || {};
+  st.claimed = st.claimed || {};
+  return st;
+}
+
+function missionPayload(st) {
+  const items = dayMissions(st.day).map((m) => ({
+    id: m.id, title: m.title, target: m.target,
+    prog: Math.min(st.prog[m.stat] || 0, m.target),
+    coins: m.coins, gems: m.gems, claimed: !!st.claimed[m.id],
+  }));
+  return { t: "ms_data", items, reset: secsToReset() };
+}
+
+async function addMissionProgress(uid, add) {
+  const st = await getMissionState(uid);
+  for (const k of Object.keys(add)) st.prog[k] = (st.prog[k] || 0) + add[k];
+  await db.ref("users/" + uid + "/missions/prog").set(st.prog);
+}
+
+async function addCurrency(uid, coins, gems) {
+  const ref = db.ref("users/" + uid);
+  if (coins) await ref.child("coins").transaction((c) => (c || 0) + coins);
+  if (gems) await ref.child("gems").transaction((g) => (g || 0) + gems);
+  return profileOf((await ref.once("value")).val() || {});
+}
+
+async function msClaim(ws, id) {
+  id = String(id || "");
+  const st = await getMissionState(ws.uid);
+  const m = dayMissions(st.day).find((x) => x.id === id);
+  if (!m || st.claimed[id] || (st.prog[m.stat] || 0) < m.target) {
+    return send(ws, { t: "ms_result", ok: false, id });
+  }
+  const res = await db.ref("users/" + ws.uid + "/missions/claimed/" + id).transaction((cur) => (cur ? undefined : true));
+  if (!res.committed) return send(ws, { t: "ms_result", ok: false, id });
+  st.claimed[id] = true;
+  const profile = await addCurrency(ws.uid, m.coins, m.gems);
+  send(ws, { t: "ms_result", ok: true, id, coins: m.coins, gems: m.gems, profile });
+  send(ws, missionPayload(st));
+}
+
+async function getLogin(uid) {
+  const v = (await db.ref("users/" + uid + "/login").once("value")).val() || {};
+  const today = istDay(0);
+  const yest = istDay(-1);
+  const last = v.last || "";
+  const streak = v.streak || 0;
+  let shown = 0;
+  let next = 1;
+  const claimedToday = last === today;
+  if (claimedToday) {
+    shown = streak;
+    next = streak + 1;
+  } else if (last === yest && streak < 7) {
+    shown = streak;
+    next = streak + 1;
+  }
+  return { shown, next, claimedToday, today };
+}
+
+function loginPayload(l) {
+  return { t: "lg_data", shown: l.shown, claimed_today: l.claimedToday, next: l.next, rewards: LOGIN_REWARDS };
+}
+
+async function lgClaim(ws) {
+  const l = await getLogin(ws.uid);
+  if (l.claimedToday || l.next < 1 || l.next > 7) return send(ws, { t: "lg_result", ok: false, m: "already" });
+  const res = await db.ref("users/" + ws.uid + "/login").transaction((cur) => {
+    cur = cur || {};
+    if (cur.last === l.today) return undefined;
+    return { streak: l.next, last: l.today };
+  });
+  if (!res.committed) return send(ws, { t: "lg_result", ok: false, m: "already" });
+  const r = LOGIN_REWARDS[l.next - 1];
+  const profile = await addCurrency(ws.uid, r.coins, r.gems);
+  send(ws, { t: "lg_result", ok: true, day: l.next, coins: r.coins, gems: r.gems, profile });
+  send(ws, loginPayload(await getLogin(ws.uid)));
+}
+
+async function stData(ws) {
+  const u = (await db.ref("users/" + ws.uid).once("value")).val() || {};
+  const owned = u.skins || {};
+  const skins = Object.keys(SKINS).map((id) => ({
+    id, name: SKINS[id].name, price: SKINS[id].price, cur: SKINS[id].cur, owned: id === "default" || !!owned[id],
+  }));
+  send(ws, { t: "st_data", skins, equipped: u.skin || "default", profile: profileOf(u) });
+}
+
+async function stBuy(ws, id) {
+  id = String(id || "");
+  const sk = SKINS[id];
+  const fail = (m) => send(ws, { t: "st_result", a: "buy", ok: false, m, id });
+  if (!sk || id === "default") return fail("bad");
+  const own = await db.ref("users/" + ws.uid + "/skins/" + id).transaction((cur) => (cur ? undefined : true));
+  if (!own.committed) return fail("owned");
+  const res = await db.ref("users/" + ws.uid + "/" + sk.cur).transaction((c) => ((c || 0) >= sk.price ? (c || 0) - sk.price : undefined));
+  if (!res.committed) {
+    await db.ref("users/" + ws.uid + "/skins/" + id).remove();
+    return fail("poor");
+  }
+  send(ws, { t: "st_result", a: "buy", ok: true, m: "ok", id });
+  await stData(ws);
+}
+
+async function stEquip(ws, id) {
+  id = String(id || "");
+  const fail = (m) => send(ws, { t: "st_result", a: "equip", ok: false, m, id });
+  if (!SKINS[id]) return fail("bad");
+  if (id !== "default" && !(await db.ref("users/" + ws.uid + "/skins/" + id).once("value")).val()) return fail("not_owned");
+  await db.ref("users/" + ws.uid + "/skin").set(id);
+  ws.skin = id;
+  send(ws, { t: "st_result", a: "equip", ok: true, m: "ok", id });
+  await stData(ws);
+  const p = partyOf(ws);
+  if (p) broadcastParty(p);
+}
+
 // ---------- MESSAGES ----------
 async function handle(ws, m) {
   const t = m.t;
@@ -427,6 +623,18 @@ async function handle(ws, m) {
   if (t === "claim") return doClaim(ws, m.username);
   if (t === "match_end") return doMatchEnd(ws, m);
   if (t === "sq_start") return sqStart(ws, m);
+  if (t === "lb_get") return doLeaderboard(ws);
+
+  if (t === "ms_get" || t === "ms_claim" || t === "lg_get" || t === "lg_claim" || t === "st_get" || t === "st_buy" || t === "st_equip") {
+    if (!db || !ws.uid || !ws.username) return;
+    if (t === "ms_get") return send(ws, missionPayload(await getMissionState(ws.uid)));
+    if (t === "ms_claim") return msClaim(ws, m.id);
+    if (t === "lg_get") return send(ws, loginPayload(await getLogin(ws.uid)));
+    if (t === "lg_claim") return lgClaim(ws);
+    if (t === "st_get") return stData(ws);
+    if (t === "st_buy") return stBuy(ws, m.id);
+    if (t === "st_equip") return stEquip(ws, m.id);
+  }
 
   if (t === "fr_list" || t === "fr_send" || t === "fr_accept" || t === "fr_decline" || t === "fr_remove") {
     if (!db || !ws.uid || !ws.username) {
@@ -443,7 +651,7 @@ async function handle(ws, m) {
     if (!ws.uid || !ws.username) return;
     if (t === "pt_get") {
       const p = partyOf(ws);
-      return send(ws, p ? partyMsg(p) : { t: "pt_state", leader: "", members: [] });
+      return send(ws, p ? partyMsg(p) : { t: "pt_state", leader: "", members: [], skins: [] });
     }
     if (t === "pt_invite") return ptInvite(ws, m.username);
     if (t === "pt_accept") return ptAccept(ws);
@@ -510,13 +718,14 @@ const server = http.createServer((req, res) => {
   res.end("ok rooms=" + rooms.size + " online=" + online.size + " parties=" + parties.size + " db=" + (db ? "yes" : "NO"));
 });
 
-const wss = new WebSocketServer({ server, maxPayload: 8192 });
+const wss = new WebSocketServer({ server, maxPayload: 16384 });
 
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.room = null;
   ws.uid = "";
   ws.username = "";
+  ws.skin = "default";
   ws.friends = null;
   ws.party = null;
   ws.on("pong", () => { ws.isAlive = true; });
